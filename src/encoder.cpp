@@ -1,9 +1,14 @@
 #include "encoder.hpp"
 #include <fstream>
+#include <iostream>
 #include <cstring>
 #include <sstream>
 #include <numeric>
+#include <algorithm>
+#include <thread>
+#include <future>
 #include <zlib.h>
+#include "zstd.h"
 
 GQHeader Encoder::build_header(const std::string& /*filename*/,
                                 const std::vector<std::string>& reads,
@@ -87,20 +92,53 @@ EncodedPayload Encoder::build_payload(const std::vector<std::string>& sequences,
     EncodedPayload payload;
     payload.read_lengths.reserve(sequences.size());
 
-    // Concatenate all sequences into one string, tracking read lengths
-    std::string all_seqs;
     uint64_t total_bases = 0;
     for (const auto& seq : sequences) {
         payload.read_lengths.push_back(static_cast<uint32_t>(seq.size()));
         total_bases += seq.size();
     }
+    std::string all_seqs;
     all_seqs.reserve(total_bases);
     for (const auto& seq : sequences) {
         all_seqs += seq;
     }
 
-    // Encode all at once (no per-read padding waste)
-    payload.seq_data = encode_sequence(all_seqs, 0, payload.n_positions);
+    // Parallel sequence encoding
+    int num_threads = std::thread::hardware_concurrency();
+    if (num_threads < 1) num_threads = 1;
+    if (total_bases < 65536) num_threads = 1;
+
+    size_t chunk = (total_bases + static_cast<uint64_t>(num_threads) - 1) / num_threads;
+    std::vector<std::future<std::pair<std::vector<uint8_t>, std::vector<uint32_t>>>> futures;
+
+    for (int t = 0; t < num_threads; ++t) {
+        size_t start = static_cast<size_t>(t) * chunk;
+        if (start >= static_cast<size_t>(total_bases)) break;
+        size_t end = std::min(start + chunk, static_cast<size_t>(total_bases));
+        futures.push_back(std::async(std::launch::async,
+            [&all_seqs, start, end]() {
+                std::vector<uint32_t> npos;
+                auto data = encode_sequence(all_seqs.data() + start, end - start,
+                                            static_cast<uint32_t>(start), npos);
+                return std::make_pair(std::move(data), std::move(npos));
+            }));
+    }
+
+    std::vector<std::vector<uint8_t>> seq_chunks;
+    seq_chunks.reserve(futures.size());
+    for (auto& f : futures) {
+        auto result = f.get();
+        seq_chunks.push_back(std::move(result.first));
+        payload.n_positions.insert(payload.n_positions.end(),
+                                   result.second.begin(), result.second.end());
+    }
+
+    size_t total_sb = 0;
+    for (const auto& c : seq_chunks) total_sb += c.size();
+    payload.seq_data.reserve(total_sb);
+    for (const auto& c : seq_chunks) {
+        payload.seq_data.insert(payload.seq_data.end(), c.begin(), c.end());
+    }
 
     if (!qualities.empty()) {
         int offset = detect_phred_offset(qualities);
@@ -144,11 +182,9 @@ std::vector<uint8_t> Encoder::encode(const GQHeader& hdr, const EncodedPayload& 
     body.insert(body.end(), payload.qual_data.begin(), payload.qual_data.end());
 
     // Compress
-    auto compressed = compress(body);
-
-    // Header
     auto hdr_copy = hdr;
     hdr_copy.original_size = body.size();
+    auto compressed = compress(body, hdr_copy);
     hdr_copy.compressed_size = compressed.size();
     auto hdr_bytes = serialize_header(hdr_copy);
 
@@ -173,9 +209,98 @@ std::vector<uint8_t> Encoder::serialize_header(const GQHeader& hdr) {
     return buf;
 }
 
-std::vector<uint8_t> Encoder::compress(const std::vector<uint8_t>& data) {
-    // TODO: implement ZSTD compression
-    return data;
+struct DecodeChunkResult {
+    std::vector<FastQRead> reads;
+    uint32_t non_n_offset;
+    size_t n_idx;
+};
+
+static std::pair<uint32_t, size_t> decode_start_state(
+    uint32_t global_pos, const std::vector<uint32_t>& n_positions) {
+    auto it = std::lower_bound(n_positions.begin(), n_positions.end(), global_pos);
+    size_t n_idx = static_cast<size_t>(it - n_positions.begin());
+    uint32_t non_n_offset = global_pos - static_cast<uint32_t>(n_idx);
+    return {non_n_offset, n_idx};
+}
+
+static DecodeChunkResult decode_chunk(
+    const uint8_t* seq_data,
+    const std::vector<uint32_t>& n_positions,
+    const std::vector<uint32_t>& read_lengths,
+    uint64_t start_read, uint64_t end_read,
+    uint32_t start_global_pos,
+    uint32_t start_non_n_offset,
+    size_t start_n_idx) {
+    DecodeChunkResult result;
+    result.reads.reserve(static_cast<size_t>(end_read - start_read));
+    uint32_t global_pos = start_global_pos;
+    uint32_t non_n_offset = start_non_n_offset;
+    size_t n_idx = start_n_idx;
+    for (uint64_t i = start_read; i < end_read; ++i) {
+        FastQRead read;
+        read.sequence.reserve(read_lengths[static_cast<size_t>(i)]);
+        uint32_t read_end = global_pos + read_lengths[static_cast<size_t>(i)];
+        for (uint32_t gp = global_pos; gp < read_end; ++gp) {
+            if (n_idx < n_positions.size() && n_positions[n_idx] == gp) {
+                read.sequence += 'N';
+                n_idx++;
+            } else {
+                uint8_t byte = seq_data[non_n_offset / 4];
+                uint8_t shift = 6 - 2 * (non_n_offset % 4);
+                uint8_t v = (byte >> shift) & 0x03;
+                read.sequence += nuc_to_char(static_cast<Nucleotide>(v));
+                non_n_offset++;
+            }
+        }
+        global_pos = read_end;
+        result.reads.push_back(std::move(read));
+    }
+    result.non_n_offset = non_n_offset;
+    result.n_idx = n_idx;
+    return result;
+}
+
+static std::vector<uint8_t> decompress_zstd(const uint8_t* data, size_t size, size_t original_size) {
+    if (size == 0) return {};
+    std::vector<uint8_t> result(original_size);
+    size_t rc = ZSTD_decompress(result.data(), result.size(), data, size);
+    if (ZSTD_isError(rc)) {
+        std::cerr << "ZSTD decompression error: " << ZSTD_getErrorName(rc) << "\n";
+        return {};
+    }
+    result.resize(rc);
+    return result;
+}
+
+std::vector<uint8_t> Encoder::compress(const std::vector<uint8_t>& data, GQHeader& hdr) {
+    size_t bound = ZSTD_compressBound(data.size());
+    if (ZSTD_isError(bound)) {
+        hdr.compression = 0;
+        return data;
+    }
+
+    ZSTD_CCtx* cctx = ZSTD_createCCtx();
+    if (!cctx) {
+        hdr.compression = 0;
+        return data;
+    }
+
+    int num_threads = std::thread::hardware_concurrency();
+    if (num_threads < 1) num_threads = 1;
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, num_threads);
+
+    std::vector<uint8_t> compressed(bound);
+    size_t rc = ZSTD_compress2(cctx, compressed.data(), compressed.size(),
+                                data.data(), data.size());
+    ZSTD_freeCCtx(cctx);
+
+    if (ZSTD_isError(rc) || rc >= data.size()) {
+        hdr.compression = 0;
+        return data;
+    }
+    hdr.compression = 1;
+    compressed.resize(rc);
+    return compressed;
 }
 
 bool Encoder::read_header(const std::string& path, GQHeader& hdr_out,
@@ -192,9 +317,17 @@ bool Encoder::read_header(const std::string& path, GQHeader& hdr_out,
         body_size = hdr_out.compressed_size;
 
     in.seekg(sizeof(GQHeader));
-    body_out.resize(body_size);
-    in.read(reinterpret_cast<char*>(body_out.data()), static_cast<std::streamsize>(body_size));
-    return in.good();
+    std::vector<uint8_t> compressed(body_size);
+    in.read(reinterpret_cast<char*>(compressed.data()), static_cast<std::streamsize>(body_size));
+    if (!in.good()) return false;
+
+    if (hdr_out.compression != 0) {
+        body_out = decompress_zstd(compressed.data(), compressed.size(),
+                                   static_cast<size_t>(hdr_out.original_size));
+        return !body_out.empty();
+    }
+    body_out = std::move(compressed);
+    return true;
 }
 
 static uint32_t read_u32_le(const uint8_t* p) {
@@ -205,16 +338,14 @@ static uint32_t read_u32_le(const uint8_t* p) {
 }
 
 std::vector<FastQRead> Encoder::decode(const GQHeader& hdr, const std::vector<uint8_t>& body) {
-    std::vector<FastQRead> reads;
-    if (hdr.read_count == 0) return reads;
-    reads.reserve(hdr.read_count);
+    if (hdr.read_count == 0) return {};
 
     size_t pos = 0;
 
     // Read lengths
-    std::vector<uint32_t> read_lengths(hdr.read_count);
+    std::vector<uint32_t> read_lengths(static_cast<size_t>(hdr.read_count));
     for (uint64_t i = 0; i < hdr.read_count; ++i) {
-        read_lengths[i] = read_u32_le(body.data() + pos);
+        read_lengths[static_cast<size_t>(i)] = read_u32_le(body.data() + pos);
         pos += 4;
     }
 
@@ -239,33 +370,52 @@ std::vector<FastQRead> Encoder::decode(const GQHeader& hdr, const std::vector<ui
 
     const uint8_t* qual_data = hdr.file_type ? body.data() + pos : nullptr;
 
-    // Decode sequences (single pass through data and n_positions)
-    uint32_t global_pos = 0;
-    uint32_t non_n_offset = 0;
-    size_t n_idx = 0;
+    // Pre-compute cumulative positions per read
+    std::vector<uint32_t> cum_pos(static_cast<size_t>(hdr.read_count) + 1, 0);
     for (uint64_t i = 0; i < hdr.read_count; ++i) {
-        FastQRead read;
-        read.sequence.reserve(read_lengths[i]);
-        uint32_t read_end = global_pos + read_lengths[i];
-        for (uint32_t gp = global_pos; gp < read_end; ++gp) {
-            if (n_idx < n_positions.size() && n_positions[n_idx] == gp) {
-                read.sequence += 'N';
-                n_idx++;
-            } else {
-                uint8_t byte = seq_data[non_n_offset / 4];
-                uint8_t shift = 6 - 2 * (non_n_offset % 4);
-                uint8_t v = (byte >> shift) & 0x03;
-                read.sequence += nuc_to_char(static_cast<Nucleotide>(v));
-                non_n_offset++;
-            }
-        }
-        global_pos = read_end;
-        reads.push_back(std::move(read));
+        cum_pos[static_cast<size_t>(i) + 1] =
+            cum_pos[static_cast<size_t>(i)] + read_lengths[static_cast<size_t>(i)];
     }
 
-    // Decode qualities
+    // Parallel sequence decode
+    int num_threads = std::thread::hardware_concurrency();
+    if (num_threads < 1) num_threads = 1;
+    if (hdr.read_count < 1000) num_threads = 1;
+
+    uint64_t chunk_reads = (hdr.read_count + static_cast<uint64_t>(num_threads) - 1)
+                           / static_cast<uint64_t>(num_threads);
+    std::vector<std::future<DecodeChunkResult>> futures;
+
+    for (int t = 0; t < num_threads; ++t) {
+        uint64_t chunk_start = static_cast<uint64_t>(t) * chunk_reads;
+        if (chunk_start >= hdr.read_count) break;
+        uint64_t chunk_end = std::min(chunk_start + chunk_reads, hdr.read_count);
+
+        uint32_t chunk_global = cum_pos[static_cast<size_t>(chunk_start)];
+        auto [non_n_off, n_idx_off] = decode_start_state(chunk_global, n_positions);
+
+        futures.push_back(std::async(std::launch::async,
+            [seq_data, &n_positions, &read_lengths, chunk_start, chunk_end,
+             chunk_global, non_n_off, n_idx_off]() {
+                return decode_chunk(seq_data, n_positions, read_lengths,
+                                    chunk_start, chunk_end, chunk_global,
+                                    non_n_off, n_idx_off);
+            }));
+    }
+
+    std::vector<FastQRead> reads;
+    reads.reserve(static_cast<size_t>(hdr.read_count));
+    for (auto& f : futures) {
+        auto cr = f.get();
+        for (auto& r : cr.reads) {
+            reads.push_back(std::move(r));
+        }
+    }
+
+    // Decode qualities (single-threaded, fast)
     if (hdr.file_type && qual_data) {
         std::vector<size_t> lens;
+        lens.reserve(reads.size());
         for (const auto& r : reads) lens.push_back(r.sequence.size());
         auto quals = unpack_qualities(qual_data, qual_bytes, lens, hdr.phred_offset);
         for (size_t i = 0; i < reads.size(); ++i) {

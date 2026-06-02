@@ -16,9 +16,12 @@ BioPack-FQ is a high-performance, open-source binary storage format designed to 
   - [2.3 Quality Score Encoding](#23-quality-score-encoding)
   - [2.4 File Architecture](#24-file-architecture)
   - [2.5 Metadata Header](#25-metadata-header)
+  - [2.6 Compression](#26-compression)
+  - [2.7 Multi-Threaded Encoding](#27-multi-threaded-encoding)
 - [3. Results](#3-results)
   - [3.1 Compression Benchmarks](#31-compression-benchmarks)
   - [3.2 Lossless Roundtrip Validation](#32-lossless-roundtrip-validation)
+  - [3.3 Pipeline Impact Assessment](#33-pipeline-impact-assessment)
 - [4. Usage](#4-usage)
 - [5. Build](#5-build)
 - [6. Technology Stack](#6-technology-stack)
@@ -29,7 +32,7 @@ BioPack-FQ is a high-performance, open-source binary storage format designed to 
 
 ## Abstract
 
-Next-generation sequencing produces vast quantities of data, commonly stored in FASTA or FASTQ formats. These human-readable formats are highly inefficient, using 8 bits per nucleotide when only 2 bits are theoretically required. BioPack-FQ addresses this by introducing a compact binary format (`.g` for sequences, `.gq` for sequences with quality scores) that encodes DNA bases as 2-bit values, packs Phred quality scores as 6-bit values, and stores ambiguous bases (N) via a position index. On a 16 MB Oxford Nanopore dataset comprising 29,170 reads and 5.99 million bases, BioPack-FQ achieves a **62.9% storage reduction** without compression. The format supports gzipped input files and provides comprehensive metadata for quality assessment, including Q20/Q30 metrics.
+Next-generation sequencing produces vast quantities of data, commonly stored in FASTA or FASTQ formats. These human-readable formats are highly inefficient, using 8 bits per nucleotide when only 2 bits are theoretically required. BioPack-FQ addresses this by introducing a compact binary format (`.g` for sequences, `.gq` for sequences with quality scores) that encodes DNA bases as 2-bit values, packs Phred quality scores as 6-bit values, and stores ambiguous bases (N) via a position index. On a 16 MB Oxford Nanopore dataset comprising 29,170 reads and 5.99 million bases, BioPack-FQ with ZSTD compression achieves a **69.2% storage reduction** (16.4 MB → 5.1 MB). The format supports gzipped input files, ZSTD-compressed output, multi-threaded encoding, and provides comprehensive metadata for quality assessment including Q20/Q30 metrics.
 
 ---
 
@@ -104,6 +107,8 @@ Header metadata records `phred_offset`, `phred_min`, `phred_max`, `phred_avg`, `
 │     2-bit Packed Sequence Data   │  A/C/G/T only
 ├─────────────────────────────────┤
 │  6-bit Packed Quality (.gq)      │  Phred scores (optional)
+├─────────────────────────────────┤
+│     ZSTD-Compressed Payload     │  Entire block above is compressed
 └─────────────────────────────────┘
 ```
 
@@ -115,7 +120,7 @@ The 200-byte fixed header stores comprehensive metadata:
 |-------|------|-------------|
 | `version` | 4 B | Format version |
 | `file_type` | 1 B | 0 = `.g`, 1 = `.gq` |
-| `compression` | 1 B | 0 = none, 1 = ZSTD, 2 = GZIP |
+| `compression` | 1 B | 0 = none, 1 = ZSTD |
 | `original_size` | 8 B | Uncompressed payload size |
 | `compressed_size` | 8 B | Compressed payload size |
 | `read_count` | 8 B | Number of reads |
@@ -131,6 +136,18 @@ The 200-byte fixed header stores comprehensive metadata:
 | `original_file_size` | 8 B | Original input file size |
 | `created_timestamp` | 8 B | Unix timestamp |
 
+### 2.6 Compression
+
+The entire payload block (read lengths, N-position list, packed sequence data, and packed quality data) is compressed with **ZSTD** using the advanced API with multi-threaded compression (`ZSTD_c_nbWorkers` set to the number of available CPU cores). The compression level defaults to 3, balancing speed and ratio.
+
+### 2.7 Multi-Threaded Encoding
+
+Encoding and decoding are parallelized at multiple levels:
+
+- **Sequence encoding**: The concatenated sequence string is split into chunks; each thread independently 2-bit packs its chunk and records N positions, with results merged in order.
+- **ZSTD compression**: The ZSTD library's built-in multi-threading (`nbWorkers`) compresses the payload using all available cores.
+- **Sequence decoding**: Reads are split into chunks; each thread independently decodes its chunk using binary search on the N-position list to determine its starting state.
+
 ---
 
 ## 3. Results
@@ -142,11 +159,16 @@ Test dataset: Oxford Nanopore *rbcLa* amplicon sequencing, 29,170 reads, 5,989,6
 | Format | Size | Reduction (vs. FASTQ) |
 |--------|------|-----------------------|
 | Original FASTQ | 16,450,568 B | — |
-| BioPack-FQ (`.gq`) | 6,106,504 B | **62.9%** |
+| BioPack-FQ (`.gq`, no compression) | 6,106,504 B | 62.9% |
+| BioPack-FQ (`.gq`, ZSTD) | 5,062,164 B | **69.2%** |
 
-BioPack-FQ achieves this reduction without compression (ZSTD/GZIP compression is a planned feature). The primary savings come from 2-bit nucleotide packing (75% reduction on sequence data) and 6-bit quality packing (25% reduction on quality data), offset by headers and read-length metadata.
+Primary savings come from 2-bit nucleotide packing (75% reduction on sequence data), 6-bit quality packing (25% reduction on quality data), and ZSTD compression of the payload, offset by headers and read-length metadata.
 
-### 3.2 Impact on Bioinformatics Pipelines
+### 3.2 Lossless Roundtrip Validation
+
+Full roundtrip testing (FASTQ → `.gq` → decoded FASTQ) produces byte-identical sequences and quality scores, verified by `diff` across all 29,170 reads and 5.99 million bases.
+
+### 3.3 Pipeline Impact Assessment
 
 BioPack-FQ is a **storage and transfer format**, not a compute accelerator. Core pipeline stages — alignment, sorting, variant calling — are CPU-bound and will not run faster because the input is stored in `.gq` instead of FASTQ. The format's value lies in the data logistics that surround computation.
 
@@ -161,10 +183,10 @@ BioPack-FQ is a **storage and transfer format**, not a compute accelerator. Core
 
 | Domain | Benefit | Why |
 |--------|---------|-----|
-| **Cloud storage** | 63% less egress/ingress cost | Files are 63% smaller |
-| **Cloud transfer** | 63% faster upload/download | Proportional to size reduction |
-| **Multi-sample projects** | 100 samples: 15 TB → 5.5 TB | Storage cost savings at scale |
-| **Archival (S3 Glacier, tape)** | Lower tier cost per genome | Pay for 55 GB instead of 150 GB |
+| **Cloud storage** | 69% less egress/ingress cost | Files are 69% smaller |
+| **Cloud transfer** | 69% faster upload/download | Proportional to size reduction |
+| **Multi-sample projects** | 100 samples: 15 TB → 4.6 TB | Storage cost savings at scale |
+| **Archival (S3 Glacier, tape)** | Lower tier cost per genome | Pay for 48 GB instead of 150 GB |
 | **HPC scratch space** | Reduced disk footprint per job | Important on shared filesystems |
 | **Concurrent NAS access** | Less I/O contention per read | Multiple pipelines reading simultaneously |
 | **Output of basecallers** | Compressed on-the-fly without gzip overhead | No read-recompress cycle |
@@ -175,9 +197,9 @@ BioPack-FQ is a **storage and transfer format**, not a compute accelerator. Core
 |-----------|--------|-----------|-------------------|
 | Load into memory | FASTQ | 150 GB | 1.0× |
 | Load into memory | gzip FASTQ | 50 GB + decompress | 2–3× slower * |
-| Load into memory | `.gq` | 55 GB | **0.37×** |
+| Load into memory | `.gq` | 46 GB | **0.31×** |
 | FASTQ → aligner pipe | FASTQ | 150 GB read + write /dev/null | 1.0× |
-| `.gq` → aligner pipe | `.gq` decode → stdout | 55 GB read + bit unpack | **~0.5×** |
+| `.gq` → aligner pipe | `.gq` decode → stdout | 46 GB read + bit unpack | **~0.5×** |
 
 * gzip decompression is CPU-bound and typically reads slower than raw I/O on modern SSDs.
 
@@ -193,10 +215,6 @@ For a single-sample variant-calling pipeline (GATK best practices, ~24 h total),
 #### Key Takeaway
 
 BioPack-FQ optimizes **data logistics**, not computation. Use it to reduce storage costs, accelerate transfers, and ease I/O pressure in multi-sample environments. Do not expect faster alignment or variant calling.
-
-### 3.3 Lossless Roundtrip Validation
-
-Full roundtrip testing (FASTQ → `.gq` → decoded FASTQ) produces byte-identical sequences and quality scores, verified by `diff` across all 29,170 reads and 5.99 million bases.
 
 ---
 
@@ -247,7 +265,7 @@ biopack <input> [-d] [-v] [-o output]
 
 ## 5. Build
 
-**Dependencies:** `g++` (C++20), `zlib` (development headers)
+**Dependencies:** `g++` (C++20), `zlib` (development headers), `libzstd` (development headers)
 
 ```bash
 git clone <repo>
@@ -267,26 +285,25 @@ The build produces a single `biopack` binary.
 | Language | C++20 |
 | Build system | GNU Make |
 | Decompression | zlib (gzread) |
-| Planned compression | ZSTD / GZIP |
-| Planned hashing | OpenSSL / xxHash |
-| Planned SIMD | AVX2 / AVX-512 |
-| Planned parallelism | std::thread / OpenMP |
+| Compression | ZSTD (multi-threaded) |
+| Parallelism | std::thread / std::async |
+| Hashing | Planned (OpenSSL / xxHash) |
+| SIMD | Planned (AVX2 / AVX-512) |
 
 ---
 
 ## 7. Future Work
 
-- **ZSTD / GZIP compression** of the payload block
 - **Per-read header storage** for full FASTQ roundtrip with read names
 - **Random-access indexing** for querying specific reads without full decode
-- **Multi-threaded encoding/decoding**
 - **Streaming support** for pipelining with bioinformatics tools
 - **k-mer frequency tables** and **Bloom filters** for rapid dataset comparison
 - **SIMD-optimized** packing and unpacking kernels
 - **Checksum validation** via MD5 / SHA-256
+- **GZIP compression** as an alternative to ZSTD
 
 ---
 
 ## 8. License
 
-MIT
+GNU General Public License v3.0 (GPLv3). Commercial licensing exceptions available upon request. See `LICENSE` for details.

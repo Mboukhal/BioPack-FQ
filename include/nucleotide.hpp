@@ -45,14 +45,13 @@ inline uint8_t pack_nucleotides(uint8_t v0, uint8_t v1, uint8_t v2, uint8_t v3) 
 
 // Encode a DNA string: skip Ns, record their positions, pack only A/C/G/T
 // n_positions: global N positions appended here
-inline std::vector<uint8_t> encode_sequence(const std::string& seq,
+inline std::vector<uint8_t> encode_sequence(const char* seq, size_t len,
                                              uint32_t base_offset,
                                              std::vector<uint32_t>& n_positions) {
     std::vector<uint8_t> result;
-    // collect non-N bases
     std::vector<uint8_t> bases;
-    bases.reserve(seq.size());
-    for (size_t i = 0; i < seq.size(); ++i) {
+    bases.reserve(len);
+    for (size_t i = 0; i < len; ++i) {
         char c = seq[i];
         if (c == 'N' || c == 'n') {
             n_positions.push_back(static_cast<uint32_t>(base_offset + i));
@@ -61,7 +60,6 @@ inline std::vector<uint8_t> encode_sequence(const std::string& seq,
             bases.push_back(v);
         }
     }
-    // pack into 2-bit
     result.reserve((bases.size() + 3) / 4);
     for (size_t i = 0; i < bases.size(); i += 4) {
         auto v0 = bases[i];
@@ -71,6 +69,12 @@ inline std::vector<uint8_t> encode_sequence(const std::string& seq,
         result.push_back(pack_nucleotides(v0, v1, v2, v3));
     }
     return result;
+}
+
+inline std::vector<uint8_t> encode_sequence(const std::string& seq,
+                                             uint32_t base_offset,
+                                             std::vector<uint32_t>& n_positions) {
+    return encode_sequence(seq.data(), seq.size(), base_offset, n_positions);
 }
 
 // Decode: reconstruct from packed data + none_list (sorted)

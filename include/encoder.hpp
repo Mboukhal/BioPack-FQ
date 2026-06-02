@@ -54,5 +54,5 @@ public:
 
 private:
     std::vector<uint8_t> serialize_header(const GQHeader& hdr);
-    std::vector<uint8_t> compress(const std::vector<uint8_t>& data);
+    std::vector<uint8_t> compress(const std::vector<uint8_t>& data, GQHeader& hdr);
 };
