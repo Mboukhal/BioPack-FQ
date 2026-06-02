@@ -1,0 +1,19 @@
+# Build
+biopack
+test/test_runner
+*.o
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temp / data
+tmp/
+*.g
+*.gq
+
+# OS
+.DS_Store
+Thumbs.db
