@@ -146,61 +146,53 @@ Test dataset: Oxford Nanopore *rbcLa* amplicon sequencing, 29,170 reads, 5,989,6
 
 BioPack-FQ achieves this reduction without compression (ZSTD/GZIP compression is a planned feature). The primary savings come from 2-bit nucleotide packing (75% reduction on sequence data) and 6-bit quality packing (25% reduction on quality data), offset by headers and read-length metadata.
 
-### 3.2 Theoretical Pipeline Performance
+### 3.2 Impact on Bioinformatics Pipelines
 
-Bioinformatics pipelines are increasingly I/O-bound as sequencing throughput outpaces storage bandwidth. The following analysis projects the impact of adopting BioPack-FQ in common workflows.
+BioPack-FQ is a **storage and transfer format**, not a compute accelerator. Core pipeline stages — alignment, sorting, variant calling — are CPU-bound and will not run faster because the input is stored in `.gq` instead of FASTQ. The format's value lies in the data logistics that surround computation.
 
-#### Storage Footprint (Human Whole-Genome 30×)
+#### What BioPack-FQ Does Not Do
 
-| Format | Estimated size | Reads a 100 Gbps link in |
-|--------|---------------|--------------------------|
-| FASTQ | 150 GB | 12 s |
-| gzip FASTQ | 50 GB | 4 s |
-| CRAM (reference-based) | 15 GB | 1.2 s |
-| **BioPack-FQ (.gq)** | **55 GB** | **4.4 s** |
-| **BioPack-FQ (.gq + ZSTD)** | **35 GB** | **2.8 s** |
-| **BioPack-FQ (.g)** | **35 GB** | **2.8 s** |
+- Does not accelerate alignment (BWA, minimap2, Bowtie)
+- Does not accelerate variant calling (GATK, FreeBayes, DeepVariant)
+- Does not provide random access to individual reads (future feature)
+- Does not replace indexing (`.bai`, `.fai`)
 
-#### I/O Throughput Comparison
+#### Where BioPack-FQ Provides Real Benefit
 
-Format read speed (single-threaded, projected from data density):
+| Domain | Benefit | Why |
+|--------|---------|-----|
+| **Cloud storage** | 63% less egress/ingress cost | Files are 63% smaller |
+| **Cloud transfer** | 63% faster upload/download | Proportional to size reduction |
+| **Multi-sample projects** | 100 samples: 15 TB → 5.5 TB | Storage cost savings at scale |
+| **Archival (S3 Glacier, tape)** | Lower tier cost per genome | Pay for 55 GB instead of 150 GB |
+| **HPC scratch space** | Reduced disk footprint per job | Important on shared filesystems |
+| **Concurrent NAS access** | Less I/O contention per read | Multiple pipelines reading simultaneously |
+| **Output of basecallers** | Compressed on-the-fly without gzip overhead | No read-recompress cycle |
 
-| Operation | Format | Throughput (MB/s) | Time per 150 GB |
-|-----------|--------|-------------------|-----------------|
-| Read | FASTQ | 400 (SATA SSD) | 6.4 min |
-| Read | gzip FASTQ | 120 (CPU-bound) | 21 min |
-| Read | `.gq` (no decompress) | 1,200 (4× less data) | **2.1 min** |
-| Read + decode | `.gq` → FASTQ | 600 | 4.3 min |
-| Read + decode | `.gq` + SIMD | 2,500 (projected) | **1.0 min** |
+#### Projected I/O Scenarios
 
-#### Pipeline Stage Acceleration
+| Operation | Format | Data read | Relative I/O time |
+|-----------|--------|-----------|-------------------|
+| Load into memory | FASTQ | 150 GB | 1.0× |
+| Load into memory | gzip FASTQ | 50 GB + decompress | 2–3× slower * |
+| Load into memory | `.gq` | 55 GB | **0.37×** |
+| FASTQ → aligner pipe | FASTQ | 150 GB read + write /dev/null | 1.0× |
+| `.gq` → aligner pipe | `.gq` decode → stdout | 55 GB read + bit unpack | **~0.5×** |
 
-Typical variant-calling pipeline (read mapping → sorting → duplication marking → variant calling):
+* gzip decompression is CPU-bound and typically reads slower than raw I/O on modern SSDs.
 
-| Stage | Input format | Time (FASTQ baseline) | Time (`.gq`) | Saving |
-|-------|-------------|----------------------|-------------|--------|
-| Data transfer (WAN, 1 Gbps) | Raw FASTQ | 20 min | **7.3 min** | 63% |
-| Data transfer (LAN, 10 Gbps) | Raw FASTQ | 2 min | **0.7 min** | 63% |
-| FASTQ → BAM (aligner input) | Raw text | 5.0 min (I/O) | 2.5 min (decode to pipe) | 50% |
-| Storage (disk / object) | Archival | 150 GB | **55 GB** | 63% |
-| Full pipeline (GATK best practices) | FASTQ → VCF | ~24 h | **~23 h** | ~4% * |
+#### Honest Assessment
 
-*Most pipeline time is CPU-bound (alignment, sorting). I/O savings matter most for transfer, storage, and multi-sample access patterns.
+For a single-sample variant-calling pipeline (GATK best practices, ~24 h total), switching from FASTQ to `.gq` would save **under 30 min** — most of the pipeline is CPU-bound alignment and calling. The real savings come when that sample is:
 
-#### Use-Case Impact Matrix
-
-| Scenario | Impact | Rationale |
-|----------|--------|-----------|
-| Cloud upload/download | **High** | 63% less data moved, proportional cost saving |
-| Multi-sample projects (n = 100) | **High** | 150 GB → 55 GB per sample; 15 TB → 5.5 TB total |
-| HPC cluster storage | **Medium** | Reduced scratch space, fewer i-nodes |
-| Real-time basecalling output | **Medium** | Stream directly to `.gq` without intermediate FASTQ |
-| Archival (object store, tape) | **High** | 55 GB vs 150 GB per genome; 63% cost reduction |
-| On-premise NAS with many concurrent reads | **High** | Reduced I/O contention scales with concurrency |
+- Uploaded to the cloud for processing
+- Stored for 6 months post-analysis
+- One of 10,000 samples in a biobank
+- Transferred between collaborators
 
 #### Key Takeaway
 
-BioPack-FQ's primary advantage in pipelines is **data reduction without compression overhead**. Unlike gzip FASTQ, which must be decompressed before use (consuming CPU and limiting throughput), BioPack-FQ can be read directly with minimal decoding cost. The projected performance gains are largest in data transfer and storage scenarios, while CPU-bound pipeline stages benefit modestly from reduced I/O wait time.
+BioPack-FQ optimizes **data logistics**, not computation. Use it to reduce storage costs, accelerate transfers, and ease I/O pressure in multi-sample environments. Do not expect faster alignment or variant calling.
 
 ### 3.3 Lossless Roundtrip Validation
 
