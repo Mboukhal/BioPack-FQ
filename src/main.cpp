@@ -87,7 +87,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // .g/.gq with -v → view (decode to stdout)
+    // .g/.gq with -v → view (decode to stdout or -o file)
     if ((fc == FileClass::G || fc == FileClass::GQ) && verbose) {
         GQHeader hdr;
         std::vector<uint8_t> body;
@@ -100,13 +100,28 @@ int main(int argc, char** argv) {
             std::cerr << "Error: decode produced no reads\n";
             return 1;
         }
-        for (const auto& r : reads) {
-            if (!r.header.empty())
-                std::cout << r.header << "\n";
-            else
-                std::cout << "@\n";
-            std::cout << r.sequence << "\n+\n"
-                      << r.quality << "\n";
+        if (output.empty()) {
+            for (const auto& r : reads) {
+                if (hdr.file_type == 1) {
+                    std::cout << (r.header.empty() ? "@" : r.header) << "\n"
+                              << r.sequence << "\n+\n"
+                              << r.quality << "\n";
+                } else {
+                    std::cout << ">" << (r.header.empty() ? "read" : r.header) << "\n"
+                              << r.sequence << "\n";
+                }
+            }
+        } else {
+            bool ok = (hdr.file_type == 0)
+                      ? Encoder::write_fasta(output.string(), reads)
+                      : Encoder::write_fastq(output.string(), reads);
+            if (ok) {
+                std::cout << "View: " << input << " -> " << output << " ("
+                          << reads.size() << " reads)\n";
+            } else {
+                std::cerr << "Error: failed to write " << output << "\n";
+                return 1;
+            }
         }
         return 0;
     }
@@ -132,48 +147,52 @@ int main(int argc, char** argv) {
         double nuc_total = static_cast<double>(hdr.nucleotide_count);
         double n_pct = nuc_total > 0 ? 100.0 * hdr.count_n / nuc_total : 0;
 
-        std::cout << "BioPack-FQ v" << hdr.version << "\n"
-                  << "File:          " << input.filename() << "\n"
-                  << "Type:          " << (hdr.file_type == 1 ? ".gq (genomic+qual)" : ".g (genomic)")
-                  << "\n"
-                  << "Created:       " << time_buf << "\n"
-                  << "Compression:   " << (hdr.compression == 0 ? "none" : hdr.compression == 1 ? "ZSTD" : "GZIP")
-                  << "\n"
-                  << "── Reads ──\n"
-                  << "  Count:       " << hdr.read_count << "\n"
-                  << "  Length:      " << hdr.min_read_length << " – " << hdr.max_read_length
-                  << " (avg " << hdr.avg_read_length << ")\n"
-                  << "── Bases ──\n"
-                  << "  Total:       " << hdr.nucleotide_count << "\n"
-                  << "  GC content:  " << hdr.gc_content << "%\n"
-                  << "  N content:   " << n_pct << "%"
-                  << " (" << hdr.count_n << ")\n"
-                  << "  A:           " << (100.0 * hdr.count_a / nuc_total) << "%\n"
-                  << "  C:           " << (100.0 * hdr.count_c / nuc_total) << "%\n"
-                  << "  G:           " << (100.0 * hdr.count_g / nuc_total) << "%\n"
-                  << "  T:           " << (100.0 * hdr.count_t / nuc_total) << "%\n";
+        auto out = output.empty() ? nullptr : new std::ofstream(output.string());
+        std::ostream& os = out ? *out : std::cout;
+
+        os << "BioPack-FQ v" << hdr.version << "\n"
+           << "File:          " << input.filename() << "\n"
+           << "Type:          " << (hdr.file_type == 1 ? ".gq (genomic+qual)" : ".g (genomic)")
+           << "\n"
+           << "Created:       " << time_buf << "\n"
+           << "Compression:   " << (hdr.compression == 0 ? "none" : hdr.compression == 1 ? "ZSTD" : "GZIP")
+           << "\n"
+           << "── Reads ──\n"
+           << "  Count:       " << hdr.read_count << "\n"
+           << "  Length:      " << hdr.min_read_length << " – " << hdr.max_read_length
+           << " (avg " << hdr.avg_read_length << ")\n"
+           << "── Bases ──\n"
+           << "  Total:       " << hdr.nucleotide_count << "\n"
+           << "  GC content:  " << hdr.gc_content << "%\n"
+           << "  N content:   " << n_pct << "%"
+           << " (" << hdr.count_n << ")\n"
+           << "  A:           " << (100.0 * hdr.count_a / nuc_total) << "%\n"
+           << "  C:           " << (100.0 * hdr.count_c / nuc_total) << "%\n"
+           << "  G:           " << (100.0 * hdr.count_g / nuc_total) << "%\n"
+           << "  T:           " << (100.0 * hdr.count_t / nuc_total) << "%\n";
 
         if (hdr.file_type == 1) {
             double q20_pct = nuc_total > 0 ? 100.0 * hdr.q20_count / nuc_total : 0;
             double q30_pct = nuc_total > 0 ? 100.0 * hdr.q30_count / nuc_total : 0;
-            std::cout << "── Quality ──\n"
-                      << "  Phred:       +" << static_cast<int>(hdr.phred_offset) << "\n"
-                      << "  Range:       " << static_cast<int>(hdr.phred_min) << " – "
-                      << static_cast<int>(hdr.phred_max)
-                      << " (avg " << static_cast<int>(hdr.phred_avg) << ")\n"
-                      << "  Q20:         " << q20_pct << "%\n"
-                      << "  Q30:         " << q30_pct << "%\n";
+            os << "── Quality ──\n"
+               << "  Phred:       +" << static_cast<int>(hdr.phred_offset) << "\n"
+               << "  Range:       " << static_cast<int>(hdr.phred_min) << " – "
+               << static_cast<int>(hdr.phred_max)
+               << " (avg " << static_cast<int>(hdr.phred_avg) << ")\n"
+               << "  Q20:         " << q20_pct << "%\n"
+               << "  Q30:         " << q30_pct << "%\n";
         }
 
         if (hdr.original_file_size > 0) {
             auto gq_size = fs::file_size(input);
             double ratio = 100.0 * gq_size / hdr.original_file_size;
-            std::cout << "── Storage ──\n"
-                      << "  Original:    " << hdr.original_file_size << " bytes\n"
-                      << "  Compressed:  " << gq_size << " bytes\n"
-                      << "  Savings:     " << (100.0 - ratio) << "%\n";
+            os << "── Storage ──\n"
+               << "  Original:    " << hdr.original_file_size << " bytes\n"
+               << "  Compressed:  " << gq_size << " bytes\n"
+               << "  Savings:     " << (100.0 - ratio) << "%\n";
         }
 
+        if (out) { std::cout << "Info written to " << output << "\n"; delete out; }
         return 0;
     }
 
@@ -193,7 +212,10 @@ int main(int argc, char** argv) {
             std::cerr << "Error: decode produced no reads\n";
             return 1;
         }
-        if (Encoder::write_fastq(output.string(), reads)) {
+        bool is_g = (fc == FileClass::G);
+        bool ok = is_g ? Encoder::write_fasta(output.string(), reads)
+                       : Encoder::write_fastq(output.string(), reads);
+        if (ok) {
             std::cout << "Decoded " << input << " -> " << output << " ("
                       << reads.size() << " reads)\n";
         } else {
@@ -209,7 +231,9 @@ int main(int argc, char** argv) {
     }
 
     std::cerr << "Parsing " << input << "...\n";
-    auto reads = Encoder::parse_fastq(input.string());
+    bool is_fasta = (fc == FileClass::FASTA);
+    auto reads = is_fasta ? Encoder::parse_fasta(input.string())
+                          : Encoder::parse_fastq(input.string());
     if (reads.empty()) {
         std::cerr << "Error: no reads found or file not found\n";
         return 1;
@@ -217,7 +241,8 @@ int main(int argc, char** argv) {
     std::cerr << "Found " << reads.size() << " reads\n";
 
     auto sequences = Encoder::extract_sequences(reads);
-    auto qualities = Encoder::extract_qualities(reads);
+    auto qualities = is_fasta ? std::vector<std::string>()
+                              : Encoder::extract_qualities(reads);
 
     Encoder enc;
     auto hdr = enc.build_header(input.string(), sequences, qualities);

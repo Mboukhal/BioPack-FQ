@@ -40,9 +40,11 @@ public:
     static std::vector<FastQRead> decode(const GQHeader& hdr, const std::vector<uint8_t>& body);
 
     static std::vector<FastQRead> parse_fastq(const std::string& path);
+    static std::vector<FastQRead> parse_fasta(const std::string& path);
     static std::vector<std::string> extract_sequences(const std::vector<FastQRead>& reads);
     static std::vector<std::string> extract_qualities(const std::vector<FastQRead>& reads);
     static bool write_fastq(const std::string& path, const std::vector<FastQRead>& reads);
+    static bool write_fasta(const std::string& path, const std::vector<FastQRead>& reads);
 
 private:
     std::vector<uint8_t> serialize_header(const GQHeader& hdr);

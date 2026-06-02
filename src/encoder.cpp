@@ -284,6 +284,40 @@ bool Encoder::write_fastq(const std::string& path, const std::vector<FastQRead>&
     return out.good();
 }
 
+bool Encoder::write_fasta(const std::string& path, const std::vector<FastQRead>& reads) {
+    std::ofstream out(path);
+    if (!out) return false;
+    for (const auto& r : reads) {
+        out << ">" << r.header << "\n" << r.sequence << "\n";
+    }
+    return out.good();
+}
+
+std::vector<FastQRead> Encoder::parse_fasta(const std::string& path) {
+    std::vector<FastQRead> result;
+    std::ifstream in(path);
+    if (!in) return result;
+
+    std::string line;
+    FastQRead current;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        if (line[0] == '>') {
+            if (!current.sequence.empty()) {
+                result.push_back(std::move(current));
+                current = FastQRead();
+            }
+            current.header = line.substr(1);
+        } else {
+            current.sequence += line;
+        }
+    }
+    if (!current.sequence.empty()) {
+        result.push_back(std::move(current));
+    }
+    return result;
+}
+
 std::vector<FastQRead> Encoder::parse_fastq(const std::string& path) {
     std::vector<FastQRead> result;
     std::ifstream in(path);
