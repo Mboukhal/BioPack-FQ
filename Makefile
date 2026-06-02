@@ -1,6 +1,6 @@
 CXX      := g++
 CXXFLAGS := -std=c++20 -Wall -Wextra -O2 -march=native -Iinclude
-LDFLAGS  := -pthread
+LDFLAGS  := -lz -pthread
 # Uncomment when implementing compression/hashing:
 # LDFLAGS  := -lzstd -lxxhash -lcrypto -pthread
 
@@ -19,7 +19,7 @@ src/%.o: src/%.cpp
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 test: $(TARGET)
-	$(CXX) $(CXXFLAGS) -o test/test_runner test/test_basic.cpp src/encoder.cpp
+	$(CXX) $(CXXFLAGS) -o test/test_runner test/test_basic.cpp src/encoder.cpp -lz
 	./test/test_runner
 
 run: $(TARGET)

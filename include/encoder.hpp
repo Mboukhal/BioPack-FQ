@@ -5,6 +5,7 @@
 #include "quality.hpp"
 #include <string>
 #include <vector>
+#include <sstream>
 
 struct FastQRead {
     std::string header;
@@ -39,8 +40,13 @@ public:
 
     static std::vector<FastQRead> decode(const GQHeader& hdr, const std::vector<uint8_t>& body);
 
+    static std::string read_file_content(const std::string& path);
+
     static std::vector<FastQRead> parse_fastq(const std::string& path);
+    static std::vector<FastQRead> parse_fastq_from(std::istream& in);
+
     static std::vector<FastQRead> parse_fasta(const std::string& path);
+    static std::vector<FastQRead> parse_fasta_from(std::istream& in);
     static std::vector<std::string> extract_sequences(const std::vector<FastQRead>& reads);
     static std::vector<std::string> extract_qualities(const std::vector<FastQRead>& reads);
     static bool write_fastq(const std::string& path, const std::vector<FastQRead>& reads);

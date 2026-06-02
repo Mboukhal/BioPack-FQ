@@ -3,6 +3,7 @@
 #include <cstring>
 #include <sstream>
 #include <numeric>
+#include <zlib.h>
 
 GQHeader Encoder::build_header(const std::string& /*filename*/,
                                 const std::vector<std::string>& reads,
@@ -293,11 +294,50 @@ bool Encoder::write_fasta(const std::string& path, const std::vector<FastQRead>&
     return out.good();
 }
 
-std::vector<FastQRead> Encoder::parse_fasta(const std::string& path) {
-    std::vector<FastQRead> result;
-    std::ifstream in(path);
-    if (!in) return result;
+std::string Encoder::read_file_content(const std::string& path) {
+    if (path.size() >= 3 && path.substr(path.size() - 3) == ".gz") {
+        gzFile gz = gzopen(path.c_str(), "rb");
+        if (!gz) return {};
+        std::string content;
+        char buf[65536];
+        int n;
+        while ((n = gzread(gz, buf, sizeof(buf))) > 0) {
+            content.append(buf, static_cast<size_t>(n));
+        }
+        gzclose(gz);
+        return content;
+    }
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return {};
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
 
+std::vector<FastQRead> Encoder::parse_fastq_from(std::istream& in) {
+    std::vector<FastQRead> result;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        FastQRead read;
+        read.header = std::move(line);
+        if (!std::getline(in, read.sequence)) break;
+        if (!std::getline(in, line)) break;
+        if (!std::getline(in, read.quality)) break;
+        result.push_back(std::move(read));
+    }
+    return result;
+}
+
+std::vector<FastQRead> Encoder::parse_fastq(const std::string& path) {
+    auto content = read_file_content(path);
+    if (content.empty()) return {};
+    std::istringstream in(content);
+    return parse_fastq_from(in);
+}
+
+std::vector<FastQRead> Encoder::parse_fasta_from(std::istream& in) {
+    std::vector<FastQRead> result;
     std::string line;
     FastQRead current;
     while (std::getline(in, line)) {
@@ -318,22 +358,11 @@ std::vector<FastQRead> Encoder::parse_fasta(const std::string& path) {
     return result;
 }
 
-std::vector<FastQRead> Encoder::parse_fastq(const std::string& path) {
-    std::vector<FastQRead> result;
-    std::ifstream in(path);
-    if (!in) return result;
-
-    std::string line;
-    while (std::getline(in, line)) {
-        if (line.empty()) continue;
-        FastQRead read;
-        read.header = std::move(line);
-        if (!std::getline(in, read.sequence)) break;
-        if (!std::getline(in, line)) break;
-        if (!std::getline(in, read.quality)) break;
-        result.push_back(std::move(read));
-    }
-    return result;
+std::vector<FastQRead> Encoder::parse_fasta(const std::string& path) {
+    auto content = read_file_content(path);
+    if (content.empty()) return {};
+    std::istringstream in(content);
+    return parse_fasta_from(in);
 }
 
 std::vector<std::string> Encoder::extract_sequences(const std::vector<FastQRead>& reads) {
