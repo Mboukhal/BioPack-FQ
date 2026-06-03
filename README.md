@@ -1,8 +1,8 @@
 # BioPack-FQ
 
-**Next-Generation Genomic Storage Format**
+**Base-4 Genomic Encoding Format**
 
-BioPack-FQ is a high-performance, open-source binary storage format designed to replace FASTA and FASTQ files for modern sequencing workloads. By encoding nucleotides at 2 bits per base and packing quality scores at 6 bits per value, it achieves substantial storage reduction while preserving lossless roundtrip fidelity.
+BioPack-FQ is a high-performance, open-source binary encoding format designed to replace FASTA and FASTQ files for modern sequencing workloads. DNA is fundamentally a base-4 (quaternary) information system — each nucleotide carries exactly 2 bits of information. By encoding nucleotides at 2 bits per base and packing quality scores at 6 bits per value, BioPack-FQ maps genomic data to its natural information-theoretic density while preserving lossless roundtrip fidelity.
 
 ---
 
@@ -16,10 +16,10 @@ BioPack-FQ is a high-performance, open-source binary storage format designed to 
   - [2.3 Quality Score Encoding](#23-quality-score-encoding)
   - [2.4 File Architecture](#24-file-architecture)
   - [2.5 Metadata Header](#25-metadata-header)
-  - [2.6 Compression](#26-compression)
+  - [2.6 Payload Entropy Coding](#26-payload-entropy-coding)
   - [2.7 Multi-Threaded Encoding](#27-multi-threaded-encoding)
 - [3. Results](#3-results)
-  - [3.1 Compression Benchmarks](#31-compression-benchmarks)
+  - [3.1 Encoding Efficiency](#31-encoding-efficiency)
   - [3.2 Lossless Roundtrip Validation](#32-lossless-roundtrip-validation)
   - [3.3 Pipeline Impact Assessment](#33-pipeline-impact-assessment)
 - [4. Usage](#4-usage)
@@ -32,21 +32,19 @@ BioPack-FQ is a high-performance, open-source binary storage format designed to 
 
 ## Abstract
 
-Next-generation sequencing produces vast quantities of data, commonly stored in FASTA or FASTQ formats. These human-readable formats are highly inefficient, using 8 bits per nucleotide when only 2 bits are theoretically required. BioPack-FQ addresses this by introducing a compact binary format (`.g` for sequences, `.gq` for sequences with quality scores) that encodes DNA bases as 2-bit values, packs Phred quality scores as 6-bit values, and stores ambiguous bases (N) via a position index. On a 16 MB Oxford Nanopore dataset comprising 29,170 reads and 5.99 million bases, BioPack-FQ with ZSTD compression achieves a **69.2% storage reduction** (16.4 MB → 5.1 MB). The format supports gzipped input files, ZSTD-compressed output, multi-threaded encoding, and provides comprehensive metadata for quality assessment including Q20/Q30 metrics.
+Next-generation sequencing produces vast quantities of data, commonly stored in FASTA or FASTQ formats. These human-readable formats use 8-bit ASCII characters to represent a fundamentally 2-bit-per-symbol information source. BioPack-FQ addresses this by introducing a compact binary format (`.g` for sequences, `.gq` for sequences with quality scores) that performs **base-4 encoding** of DNA: each of the four nucleotides (A, C, G, T) is mapped to a 2-bit code, achieving the information-theoretic lower bound. Phred quality scores are packed at 6 bits per value (the range of biologically meaningful scores). Ambiguous bases (N) are stored via a position index rather than in-band. On a 16 MB Oxford Nanopore dataset comprising 29,170 reads and 5.99 million bases, BioPack-FQ produces a 6.1 MB `.gq` file from base-4 encoding alone (**62.9% reduction**), and 5.1 MB with optional ZSTD entropy coding on top (**69.2% reduction**).
 
 ---
 
 ## 1. Introduction
 
-FASTA and FASTQ have been the cornerstone of genomic data storage for decades. Despite their ubiquity, their ASCII-based representation incurs substantial overhead:
+FASTA and FASTQ have been the cornerstone of genomic data storage for decades. Despite their ubiquity, their ASCII-based representation is information-theoretically wasteful:
 
-- **Nucleotides** stored as 8-bit ASCII characters (A, C, G, T) when 2 bits suffice
+- **Nucleotides** stored as 8-bit ASCII characters (A, C, G, T) when 2 bits suffice (log₂4 = 2)
 - **Quality scores** stored as 8-bit ASCII characters (Phred+33 or Phred+64) when 6 bits cover the biologically relevant range (0–60)
 - **Read headers** duplicated across millions of entries
 
-For a typical whole-human-genome sequencing run at 30× coverage, raw FASTQ files can exceed 200 GB. Even gzip-compressed FASTQ requires 40–70 GB. Specialized formats such as CRAM achieve better ratios but carry complexity overhead and are tailored for alignment workflows.
-
-BioPack-FQ targets a middle ground: a simple, fast, lossless binary format that replaces FASTA/FASTQ directly without requiring alignment or reference genomes.
+The fundamental insight: DNA is a base-4 information channel. Each position carries exactly one of four symbols — 2 bits of information. ASCII encoding inflates this by 4×. BioPack-FQ restores the encoding to its natural density.
 
 ---
 
@@ -54,7 +52,7 @@ BioPack-FQ targets a middle ground: a simple, fast, lossless binary format that 
 
 ### 2.1 Nucleotide Encoding
 
-Each of the four standard DNA bases is assigned a 2-bit code:
+Each of the four standard DNA bases is assigned a 2-bit code — the minimum possible for a 4-symbol alphabet:
 
 | Base | Binary |
 |------|--------|
@@ -63,18 +61,18 @@ Each of the four standard DNA bases is assigned a 2-bit code:
 | G    | 10     |
 | T    | 11     |
 
-Four bases are packed into a single byte (big-endian):
+Four bases are packed into a single byte:
 
 ```
 Byte: [b0:2][b1:2][b2:2][b3:2]
        MSB                  LSB
 ```
 
-This achieves a 4:1 compression ratio for pure sequence data relative to ASCII FASTA.
+This achieves a 4:1 encoding density improvement over ASCII FASTA.
 
 ### 2.2 Ambiguous Base (N) Handling
 
-Ambiguous bases (N) are not stored in the 2-bit packed stream. Instead, their global positions are recorded in a sorted **N-position list** (none_list) stored after the file header. During encoding, N bases are omitted from the packed data and their positions appended to the list. During decoding, the packed stream and N-position list are merged to reconstruct the original sequence.
+Ambiguous bases (N) fall outside the 2-bit code space. Rather than sacrificing a code point or using a bitmask, their global positions are recorded in a sorted **N-position list** (none_list) stored after the file header. During encoding, N bases are omitted from the 2-bit packed stream and their positions appended to the list. During decoding, the packed stream and N-position list are merged to reconstruct the original sequence.
 
 This approach adds no overhead for datasets without Ns and only ~0.25 bits per N for datasets with Ns.
 
@@ -82,7 +80,7 @@ This approach adds no overhead for datasets without Ns and only ~0.25 bits per N
 
 Quality scores (Phred) are auto-detected as Phred+33 or Phred+64 by scanning the minimum ASCII value across all reads.
 
-Each raw quality score (0–63) is stored in **6 bits**. Four scores are packed into three bytes:
+Each raw quality score (0–63) is stored in **6 bits** — sufficient to cover the full Phred range used in modern sequencing. Four scores are packed into three bytes:
 
 ```
 Byte 0: [s0:6][s1:2]
@@ -90,7 +88,7 @@ Byte 1: [s1:4][s2:4]
 Byte 2: [s2:2][s3:6]
 ```
 
-This achieves a 25% reduction over the 8-bit ASCII representation while covering the full Phred score range.
+This achieves a 25% density improvement over the 8-bit ASCII representation.
 
 Header metadata records `phred_offset`, `phred_min`, `phred_max`, `phred_avg`, `q20_count`, and `q30_count` for rapid quality assessment without scanning the packed data.
 
@@ -104,13 +102,15 @@ Header metadata records `phred_offset`, `phred_min`, `phred_max`, `phred_avg`, `
 ├─────────────────────────────────┤
 │      N-Position List            │  uint32_t count + positions
 ├─────────────────────────────────┤
-│     2-bit Packed Sequence Data   │  A/C/G/T only
+│     2-bit Packed Sequence Data   │  Base-4 encoded A/C/G/T
 ├─────────────────────────────────┤
 │  6-bit Packed Quality (.gq)      │  Phred scores (optional)
 ├─────────────────────────────────┤
-│     ZSTD-Compressed Payload     │  Entire block above is compressed
+│  (Optional) ZSTD Entropy Coding │  On-disk payload compression
 └─────────────────────────────────┘
 ```
+
+The first five sections form the semantic payload (base-4 sequences + 6-bit qualities). When written to disk, the payload may optionally be entropy-coded with ZSTD. The header's `compression` field (0 or 1) records whether entropy coding was applied.
 
 ### 2.5 Metadata Header
 
@@ -136,33 +136,33 @@ The 200-byte fixed header stores comprehensive metadata:
 | `original_file_size` | 8 B | Original input file size |
 | `created_timestamp` | 8 B | Unix timestamp |
 
-### 2.6 Compression
+### 2.6 Payload Entropy Coding
 
-The entire payload block (read lengths, N-position list, packed sequence data, and packed quality data) is compressed with **ZSTD** using the advanced API with multi-threaded compression (`ZSTD_c_nbWorkers` set to the number of available CPU cores). The compression level defaults to 3, balancing speed and ratio.
+After the semantic base-4 encoding, the binary payload can be further entropy-coded with **ZSTD** using its advanced API (`ZSTD_CCtx` with `ZSTD_c_nbWorkers` set to the number of available CPU cores, compression level 3). This is strictly optional — the base-4 encoding is the format's core contribution; ZSTD is a standard entropy coder applied on top of the already-encoded representation.
 
 ### 2.7 Multi-Threaded Encoding
 
 Encoding and decoding are parallelized at multiple levels:
 
 - **Sequence encoding**: The concatenated sequence string is split into chunks; each thread independently 2-bit packs its chunk and records N positions, with results merged in order.
-- **ZSTD compression**: The ZSTD library's built-in multi-threading (`nbWorkers`) compresses the payload using all available cores.
+- **ZSTD entropy coding**: The ZSTD library's built-in multi-threading (`nbWorkers`) compresses the payload using all available cores.
 - **Sequence decoding**: Reads are split into chunks; each thread independently decodes its chunk using binary search on the N-position list to determine its starting state.
 
 ---
 
 ## 3. Results
 
-### 3.1 Compression Benchmarks
+### 3.1 Encoding Efficiency
 
 Test dataset: Oxford Nanopore *rbcLa* amplicon sequencing, 29,170 reads, 5,989,618 total bases, Phred+33 qualities.
 
-| Format | Size | Reduction (vs. FASTQ) |
-|--------|------|-----------------------|
+| Format | Size | vs. FASTQ |
+|--------|------|-----------|
 | Original FASTQ | 16,450,568 B | — |
-| BioPack-FQ (`.gq`, no compression) | 6,106,504 B | 62.9% |
-| BioPack-FQ (`.gq`, ZSTD) | 5,062,164 B | **69.2%** |
+| BioPack-FQ base-4 encoding only (`.gq`) | 6,106,504 B | **62.9% smaller** |
+| BioPack-FQ + ZSTD entropy coding (`.gq`) | 5,062,164 B | **69.2% smaller** |
 
-Primary savings come from 2-bit nucleotide packing (75% reduction on sequence data), 6-bit quality packing (25% reduction on quality data), and ZSTD compression of the payload, offset by headers and read-length metadata.
+The primary savings come from the base-4 encoding itself (75% reduction on sequence data vs. ASCII) and 6-bit quality packing (25% on quality data). ZSTD provides additional entropy reduction on the already-densified payload.
 
 ### 3.2 Lossless Roundtrip Validation
 
@@ -189,7 +189,7 @@ BioPack-FQ is a **storage and transfer format**, not a compute accelerator. Core
 | **Archival (S3 Glacier, tape)** | Lower tier cost per genome | Pay for 48 GB instead of 150 GB |
 | **HPC scratch space** | Reduced disk footprint per job | Important on shared filesystems |
 | **Concurrent NAS access** | Less I/O contention per read | Multiple pipelines reading simultaneously |
-| **Output of basecallers** | Compressed on-the-fly without gzip overhead | No read-recompress cycle |
+| **Output of basecallers** | Encoded on-the-fly without gzip overhead | No re-encode cycle |
 
 #### Projected I/O Scenarios
 
@@ -284,8 +284,10 @@ The build produces a single `biopack` binary.
 |-----------|------------|
 | Language | C++20 |
 | Build system | GNU Make |
-| Decompression | zlib (gzread) |
-| Compression | ZSTD (multi-threaded) |
+| Base-4 encoding | 2-bit nucleotide packing |
+| Quality encoding | 6-bit Phred score packing |
+| Input decompression | zlib (gzread) |
+| Payload entropy coding | ZSTD (multi-threaded) |
 | Parallelism | std::thread / std::async |
 | Hashing | Planned (OpenSSL / xxHash) |
 | SIMD | Planned (AVX2 / AVX-512) |
@@ -300,7 +302,7 @@ The build produces a single `biopack` binary.
 - **k-mer frequency tables** and **Bloom filters** for rapid dataset comparison
 - **SIMD-optimized** packing and unpacking kernels
 - **Checksum validation** via MD5 / SHA-256
-- **GZIP compression** as an alternative to ZSTD
+- **GZIP** as an additional entropy coder option
 
 ---
 
